@@ -458,6 +458,7 @@ def show_cookie_info():
                         "no_warnings": True,
                         "skip_download": True,
                         "noplaylist": True,
+                        "format": "bestaudio*/best",
                         "extractor_args": {"youtube": {"player_client": [test_client]}},
                     }, use_cookies=True)
                     with yt_dlp.YoutubeDL(opts) as ydl:
