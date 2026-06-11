@@ -6,7 +6,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 import yt_dlp
 
-VERSION = 5
+VERSION = 6
 
 st.set_page_config(page_title="Stream Player", page_icon="🎵", layout="centered")
 
@@ -40,9 +40,9 @@ except Exception:
     IMPERSONATE = None
 
 
-def with_cookies(opts, extra=None):
+def with_cookies(opts, extra=None, use_cookies=True):
     o = dict(opts)
-    c = resolve_cookies()
+    c = resolve_cookies() if use_cookies else None
     if c:
         o["cookiefile"] = c
     o["http_headers"] = {"User-Agent": CHROME_UA, "Accept-Language": "hr-HR,hr;q=0.9,en;q=0.8"}
@@ -141,25 +141,38 @@ def fetch_audio(video_id):
 
     mu = f"https://music.youtube.com/watch?v={video_id}"
     wu = f"https://www.youtube.com/watch?v={video_id}"
+
+    def client(name):
+        return {"extractor_args": {"youtube": {"player_client": [name]}},
+                "format": "bestaudio/best"}
+
+    # (url, extra_opts, use_cookies)
     attempts = [
-        (mu, None),
-        (mu, {"extractor_args": {"youtube": {"player_client": ["web_music"]}}}),
-        (mu, {"extractor_args": {"youtube": {"player_client": ["android_music"]}},
-              "format": "bestaudio/best"}),
-        (wu, {"extractor_args": {"youtube": {"player_client": ["ios"]}},
-              "format": "bestaudio/best"}),
-        (wu, {"format": "bestaudio/best"}),
+        (mu, None, True),
+        (mu, client("web_music"), True),
+        (mu, client("android_music"), True),
+        (wu, client("ios"), True),
+        (wu, client("tv"), True),
+        (wu, client("android_vr"), True),
+        # cookies themselves sometimes cause empty format lists on server IPs,
+        # so retry the strongest clients with cookies stripped
+        (wu, client("tv"), False),
+        (wu, client("android_vr"), False),
+        (wu, client("ios"), False),
+        (wu, {"format": "bestaudio/best"}, False),
     ]
     info, last_err = None, None
-    for u, extra in attempts:
+    errors = []
+    for u, extra, use_ck in attempts:
         try:
-            with yt_dlp.YoutubeDL(with_cookies(DL_OPTS, extra)) as ydl:
+            with yt_dlp.YoutubeDL(with_cookies(DL_OPTS, extra, use_ck)) as ydl:
                 info = ydl.extract_info(u, download=True)
             break
         except Exception as e:
             last_err = e
+            errors.append(str(e)[:80])
     if info is None:
-        raise RuntimeError(f"All sources failed: {last_err}")
+        raise RuntimeError(f"All {len(attempts)} attempts failed. Last: {last_err}")
 
     path = _find_cached(video_id)
     if not path:
@@ -290,6 +303,8 @@ if "queue" not in st.session_state:
 if "current" not in st.session_state:
     st.session_state.current = None
 
+st.caption(f"v{VERSION}")
+
 # ---------------- PLAYER ON TOP ----------------
 if st.session_state.current is not None and st.session_state.queue:
     idx = st.session_state.current
@@ -417,7 +432,11 @@ with tab_setup:
         proxy_on = bool(st.secrets.get("PROXY_URL", ""))
     except Exception:
         proxy_on = False
-    st.caption(f"Proxy: {'active' if proxy_on else 'not set'}  ·  v{VERSION}")
+    try:
+        from yt_dlp.version import __version__ as ytv
+    except Exception:
+        ytv = "?"
+    st.caption(f"Proxy: {'active' if proxy_on else 'not set'}  ·  yt-dlp {ytv}  ·  v{VERSION}")
 
 # ---------------- QUEUE ----------------
 if len(st.session_state.queue) > 1:
