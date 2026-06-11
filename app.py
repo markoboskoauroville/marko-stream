@@ -7,7 +7,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 import yt_dlp
 
-VERSION = 9
+VERSION = 10
 
 st.set_page_config(page_title="Stream Player", page_icon="🎵", layout="centered")
 
@@ -59,7 +59,7 @@ def with_cookies(opts, extra=None, use_cookies=True):
         "User-Agent": CHROME_UA,
         "Accept-Language": "hr-HR,hr;q=0.9,en;q=0.8",
     }
-    o["geo_bypass"] = True
+    o["nocheckcertificate"] = True   # Streamlit Cloud has SSL inspection
     o["geo_bypass_country"] = "HR"
     try:
         proxy = st.secrets.get("PROXY_URL", "")
@@ -454,6 +454,7 @@ def show_cookie_info():
                     "no_warnings": True,
                     "skip_download": True,
                     "noplaylist": True,
+                    "nocheckcertificate": True,
                 }, use_cookies=True)
                 with yt_dlp.YoutubeDL(opts) as ydl:
                     info = ydl.extract_info(
