@@ -6,6 +6,8 @@ import streamlit as st
 import streamlit.components.v1 as components
 import yt_dlp
 
+VERSION = 4
+
 st.set_page_config(page_title="Stream Player", page_icon="🎵", layout="centered")
 
 CACHE_DIR = os.path.join(tempfile.gettempdir(), "stream_player_cache")
@@ -46,6 +48,12 @@ def with_cookies(opts, extra=None):
     o["http_headers"] = {"User-Agent": CHROME_UA, "Accept-Language": "hr-HR,hr;q=0.9,en;q=0.8"}
     o["geo_bypass"] = True
     o["geo_bypass_country"] = "HR"
+    try:
+        proxy = st.secrets.get("PROXY_URL", "")
+    except Exception:
+        proxy = ""
+    if proxy:
+        o["proxy"] = proxy
     if IMPERSONATE:
         o["impersonate"] = IMPERSONATE
     if extra:
@@ -292,6 +300,7 @@ with st.sidebar:
         st.info("Using cookies from secrets")
 
 st.title("Stream Player")
+st.caption(f"v{VERSION}")
 
 # ---------------- PLAYER ON TOP ----------------
 if st.session_state.current is not None and st.session_state.queue:
@@ -335,6 +344,18 @@ if st.session_state.current is not None and st.session_state.queue:
             st.caption(" | ".join(parts))
         except Exception as e:
             st.error(f"Playback failed: {e}")
+            try:
+                import urllib.request
+                req = urllib.request.Request(
+                    f"https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v={tr['id']}&format=json",
+                    headers={"User-Agent": CHROME_UA})
+                urllib.request.urlopen(req, timeout=8)
+                st.warning("Probe: this video EXISTS from the server region. "
+                           "The block is account, cookie or client related, not geo.")
+            except Exception:
+                st.warning("Probe: this video is NOT publicly reachable from the server "
+                           "region (US). It is deleted, private, or geo locked to certain "
+                           "countries. A proxy in PROXY_URL secret is the only fix for geo locks.")
             if st.session_state.get("play_all", True) and has_next:
                 if st.button("Skip to next"):
                     st.session_state.current = idx + 1
