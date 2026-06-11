@@ -1,4 +1,5 @@
 import os
+import json
 import tempfile
 import streamlit as st
 import yt_dlp
@@ -100,18 +101,49 @@ def search_music(query, limit=10):
     return [to_track(e) for e in (info.get("entries") or []) if e]
 
 
+def _find_cached(video_id):
+    for f in os.listdir(CACHE_DIR):
+        if f.startswith(video_id + ".") and not f.endswith(".json"):
+            return os.path.join(CACHE_DIR, f)
+    return None
+
+
 @st.cache_data(show_spinner=False, max_entries=30)
 def fetch_audio(video_id):
-    """Download audio for a video id in highest quality, return file path."""
-    for f in os.listdir(CACHE_DIR):
-        if f.startswith(video_id + "."):
-            return os.path.join(CACHE_DIR, f)
-    with yt_dlp.YoutubeDL(with_cookies(DL_OPTS)) as ydl:
-        ydl.extract_info(f"https://music.youtube.com/watch?v={video_id}", download=True)
-    for f in os.listdir(CACHE_DIR):
-        if f.startswith(video_id + "."):
-            return os.path.join(CACHE_DIR, f)
-    raise RuntimeError("Download failed")
+    """Download audio in highest quality. Returns (path, meta dict)."""
+    meta_path = os.path.join(CACHE_DIR, video_id + ".json")
+    cached = _find_cached(video_id)
+    if cached and os.path.exists(meta_path):
+        with open(meta_path) as f:
+            return cached, json.load(f)
+
+    urls = [
+        f"https://music.youtube.com/watch?v={video_id}",
+        f"https://www.youtube.com/watch?v={video_id}",
+    ]
+    info, last_err = None, None
+    for u in urls:
+        try:
+            with yt_dlp.YoutubeDL(with_cookies(DL_OPTS)) as ydl:
+                info = ydl.extract_info(u, download=True)
+            break
+        except Exception as e:
+            last_err = e
+    if info is None:
+        raise RuntimeError(f"All sources failed: {last_err}")
+
+    path = _find_cached(video_id)
+    if not path:
+        raise RuntimeError("Download failed")
+    meta = {
+        "abr": info.get("abr"),
+        "acodec": info.get("acodec"),
+        "format_id": info.get("format_id"),
+        "duration": info.get("duration"),
+    }
+    with open(meta_path, "w") as f:
+        json.dump(meta, f)
+    return path, meta
 
 
 if "queue" not in st.session_state:
@@ -174,25 +206,31 @@ if st.session_state.current is not None and st.session_state.queue:
     idx = st.session_state.current
     tr = st.session_state.queue[idx]
 
-    art, info = st.columns([1, 2])
+    art, info_col = st.columns([1, 2])
     with art:
         if tr["thumb"]:
             st.image(tr["thumb"], use_container_width=True)
-    with info:
+    with info_col:
         st.subheader(tr["title"])
         if tr["artist"]:
             st.write(tr["artist"])
+        st.toggle("Play all (continue to next track)", key="play_all", value=True)
 
     with st.spinner("Fetching audio..."):
         try:
-            path = fetch_audio(tr["id"])
+            path, meta = fetch_audio(tr["id"])
             ext = os.path.splitext(path)[1].lstrip(".").lower()
             mime = {"m4a": "audio/mp4", "webm": "audio/webm", "opus": "audio/ogg",
                     "mp3": "audio/mpeg", "ogg": "audio/ogg"}.get(ext, "audio/mp4")
             size_mb = os.path.getsize(path) / (1024 * 1024)
             with open(path, "rb") as f:
-                st.audio(f.read(), format=mime)
-            st.caption(f"Format: {ext} | {size_mb:.1f} MB")
+                st.audio(f.read(), format=mime, autoplay=True)
+            abr = meta.get("abr")
+            rate = f"{abr:.0f} kbps" if abr else "unknown bitrate"
+            codec = meta.get("acodec") or ext
+            dur = meta.get("duration")
+            dur_s = f" | {int(dur // 60)}:{int(dur % 60):02d}" if dur else ""
+            st.caption(f"{rate} | {codec} | {size_mb:.1f} MB{dur_s} | format {meta.get('format_id')}")
         except Exception as e:
             st.error(f"Playback failed: {e}")
 
@@ -203,6 +241,32 @@ if st.session_state.current is not None and st.session_state.queue:
     if n.button("Next", disabled=idx >= len(st.session_state.queue) - 1):
         st.session_state.current = idx + 1
         st.rerun()
+
+    has_next = idx < len(st.session_state.queue) - 1
+    if st.session_state.get("play_all") and has_next:
+        import streamlit.components.v1 as components
+        components.html(
+            """
+            <script>
+            const doc = window.parent.document;
+            function hook() {
+              const audios = doc.querySelectorAll('audio');
+              if (!audios.length) { setTimeout(hook, 500); return; }
+              const a = audios[audios.length - 1];
+              if (a.dataset.hooked) return;
+              a.dataset.hooked = '1';
+              a.addEventListener('ended', () => {
+                const btns = doc.querySelectorAll('button');
+                for (const b of btns) {
+                  if (b.innerText.trim() === 'Next' && !b.disabled) { b.click(); break; }
+                }
+              });
+            }
+            hook();
+            </script>
+            """,
+            height=0,
+        )
 
     if len(st.session_state.queue) > 1:
         st.write("Queue:")
