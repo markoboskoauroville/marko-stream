@@ -1,12 +1,12 @@
 import os
 import json
+import base64
 import tempfile
 import streamlit as st
+import streamlit.components.v1 as components
 import yt_dlp
 
 st.set_page_config(page_title="Stream Player", page_icon="🎵", layout="centered")
-st.title("Stream Player")
-st.caption("YouTube Music streaming in highest available quality.")
 
 CACHE_DIR = os.path.join(tempfile.gettempdir(), "stream_player_cache")
 os.makedirs(CACHE_DIR, exist_ok=True)
@@ -15,7 +15,6 @@ COOKIE_PATH = os.path.join(tempfile.gettempdir(), "stream_player_cookies.txt")
 
 
 def resolve_cookies():
-    """Uploaded cookie file wins, otherwise fall back to secrets. Returns path or None."""
     if st.session_state.get("uploaded_cookie_path"):
         return st.session_state.uploaded_cookie_path
     try:
@@ -29,11 +28,13 @@ def resolve_cookies():
     return None
 
 
-def with_cookies(opts):
+def with_cookies(opts, extra=None):
     o = dict(opts)
     c = resolve_cookies()
     if c:
         o["cookiefile"] = c
+    if extra:
+        o.update(extra)
     return o
 
 
@@ -48,7 +49,6 @@ BASE_OPTS = {
 DL_OPTS = {
     "quiet": True,
     "no_warnings": True,
-    # 141 = 256kbps AAC (Premium tier on YouTube Music), then best audio by bitrate
     "format": "141/774/bestaudio[ext=m4a]/bestaudio/best",
     "format_sort": ["abr", "asr"],
     "noplaylist": True,
@@ -74,7 +74,6 @@ def to_track(entry):
 
 
 def get_entries(url):
-    """Return list of track dicts for a song or playlist link."""
     with yt_dlp.YoutubeDL(with_cookies(BASE_OPTS)) as ydl:
         info = ydl.extract_info(url, download=False)
     if info.get("_type") == "playlist" or "entries" in info:
@@ -83,10 +82,8 @@ def get_entries(url):
 
 
 def search_music(query, limit=10):
-    """Search YouTube Music songs."""
     url = f"https://music.youtube.com/search?q={query}#songs"
-    opts = with_cookies(BASE_OPTS)
-    opts["playlist_items"] = f"1:{limit}"
+    opts = with_cookies(BASE_OPTS, {"playlist_items": f"1:{limit}"})
     info = None
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
@@ -95,7 +92,6 @@ def search_music(query, limit=10):
         pass
     if info and info.get("entries"):
         return [to_track(e) for e in info["entries"] if e][:limit]
-    # fallback so search never comes back empty just because YTM extraction changed
     with yt_dlp.YoutubeDL(with_cookies(BASE_OPTS)) as ydl:
         info = ydl.extract_info(f"ytsearch{limit}:{query}", download=False)
     return [to_track(e) for e in (info.get("entries") or []) if e]
@@ -108,7 +104,7 @@ def _find_cached(video_id):
     return None
 
 
-@st.cache_data(show_spinner=False, max_entries=30)
+@st.cache_data(show_spinner=False, max_entries=20)
 def fetch_audio(video_id):
     """Download audio in highest quality. Returns (path, meta dict)."""
     meta_path = os.path.join(CACHE_DIR, video_id + ".json")
@@ -117,14 +113,20 @@ def fetch_audio(video_id):
         with open(meta_path) as f:
             return cached, json.load(f)
 
-    urls = [
-        f"https://music.youtube.com/watch?v={video_id}",
-        f"https://www.youtube.com/watch?v={video_id}",
+    attempts = [
+        (f"https://music.youtube.com/watch?v={video_id}", None),
+        (f"https://www.youtube.com/watch?v={video_id}", None),
+        (f"https://www.youtube.com/watch?v={video_id}",
+         {"extractor_args": {"youtube": {"player_client": ["android"]}},
+          "format": "bestaudio/best"}),
+        (f"https://www.youtube.com/watch?v={video_id}",
+         {"extractor_args": {"youtube": {"player_client": ["ios"]}},
+          "format": "bestaudio/best"}),
     ]
     info, last_err = None, None
-    for u in urls:
+    for u, extra in attempts:
         try:
-            with yt_dlp.YoutubeDL(with_cookies(DL_OPTS)) as ydl:
+            with yt_dlp.YoutubeDL(with_cookies(DL_OPTS, extra)) as ydl:
                 info = ydl.extract_info(u, download=True)
             break
         except Exception as e:
@@ -137,13 +139,123 @@ def fetch_audio(video_id):
         raise RuntimeError("Download failed")
     meta = {
         "abr": info.get("abr"),
+        "asr": info.get("asr"),
         "acodec": info.get("acodec"),
+        "ext": info.get("ext"),
         "format_id": info.get("format_id"),
+        "format_note": info.get("format_note"),
         "duration": info.get("duration"),
+        "filesize": os.path.getsize(path),
     }
     with open(meta_path, "w") as f:
         json.dump(meta, f)
     return path, meta
+
+
+def render_player(path, meta, autonext):
+    """Custom HTML player with oscilloscope and waveform, both can be disabled."""
+    ext = os.path.splitext(path)[1].lstrip(".").lower()
+    mime = {"m4a": "audio/mp4", "webm": "audio/webm", "opus": "audio/ogg",
+            "mp3": "audio/mpeg", "ogg": "audio/ogg"}.get(ext, "audio/mp4")
+    with open(path, "rb") as f:
+        b64 = base64.b64encode(f.read()).decode()
+
+    html = """
+<div style="font-family:sans-serif;color:#eee;background:transparent">
+  <audio id="au" controls autoplay style="width:100%%;margin-bottom:6px"
+         src="data:%MIME%;base64,%B64%"></audio>
+  <div style="margin:4px 0 8px 0;font-size:13px">
+    <label style="margin-right:16px"><input type="checkbox" id="cb_wave" checked> Waveform</label>
+    <label><input type="checkbox" id="cb_osc" checked> Oscilloscope</label>
+  </div>
+  <canvas id="wave" width="900" height="90"
+          style="width:100%%;height:90px;background:#111;border-radius:6px;display:block;margin-bottom:6px"></canvas>
+  <canvas id="osc" width="900" height="90"
+          style="width:100%%;height:90px;background:#111;border-radius:6px;display:block"></canvas>
+</div>
+<script>
+const au = document.getElementById('au');
+const waveC = document.getElementById('wave'), oscC = document.getElementById('osc');
+const wctx = waveC.getContext('2d'), octx = oscC.getContext('2d');
+const cbW = document.getElementById('cb_wave'), cbO = document.getElementById('cb_osc');
+let actx = null, analyser = null, peaks = null;
+
+function setup() {
+  if (actx) return;
+  actx = new (window.AudioContext || window.webkitAudioContext)();
+  const src = actx.createMediaElementSource(au);
+  analyser = actx.createAnalyser();
+  analyser.fftSize = 2048;
+  src.connect(analyser);
+  analyser.connect(actx.destination);
+  fetch(au.src).then(r => r.arrayBuffer()).then(b => actx.decodeAudioData(b)).then(buf => {
+    const data = buf.getChannelData(0);
+    const n = waveC.width, step = Math.floor(data.length / n);
+    peaks = [];
+    for (let i = 0; i < n; i++) {
+      let max = 0;
+      for (let j = 0; j < step; j += 16) {
+        const v = Math.abs(data[i * step + j] || 0);
+        if (v > max) max = v;
+      }
+      peaks.push(max);
+    }
+  }).catch(()=>{});
+}
+
+function drawWave() {
+  wctx.clearRect(0,0,waveC.width,waveC.height);
+  if (!cbW.checked) return;
+  if (!peaks) return;
+  const h = waveC.height, mid = h/2;
+  const prog = au.duration ? au.currentTime / au.duration : 0;
+  for (let i = 0; i < peaks.length; i++) {
+    const ph = Math.max(2, peaks[i] * (h - 8));
+    wctx.fillStyle = (i / peaks.length) <= prog ? '#e05a00' : '#444';
+    wctx.fillRect(i, mid - ph/2, 1, ph);
+  }
+}
+
+function drawOsc() {
+  octx.clearRect(0,0,oscC.width,oscC.height);
+  if (!cbO.checked || !analyser) return;
+  const arr = new Uint8Array(analyser.fftSize);
+  analyser.getByteTimeDomainData(arr);
+  octx.strokeStyle = '#e05a00';
+  octx.lineWidth = 2;
+  octx.beginPath();
+  const sw = oscC.width / arr.length;
+  for (let i = 0; i < arr.length; i++) {
+    const y = (arr[i] / 255) * oscC.height;
+    if (i === 0) octx.moveTo(0, y); else octx.lineTo(i * sw, y);
+  }
+  octx.stroke();
+}
+
+function loop() { drawWave(); drawOsc(); requestAnimationFrame(loop); }
+loop();
+
+au.addEventListener('play', () => { setup(); if (actx) actx.resume(); });
+waveC.addEventListener('click', (e) => {
+  if (!au.duration) return;
+  const r = waveC.getBoundingClientRect();
+  au.currentTime = ((e.clientX - r.left) / r.width) * au.duration;
+});
+
+const AUTONEXT = %AUTONEXT%;
+au.addEventListener('ended', () => {
+  if (!AUTONEXT) return;
+  const btns = window.parent.document.querySelectorAll('button');
+  for (const b of btns) {
+    if (b.innerText.trim() === 'Next' && !b.disabled) { b.click(); break; }
+  }
+});
+</script>
+"""
+    html = (html.replace("%MIME%", mime)
+                .replace("%B64%", b64)
+                .replace("%AUTONEXT%", "true" if autonext else "false"))
+    components.html(html, height=300)
 
 
 if "queue" not in st.session_state:
@@ -164,44 +276,10 @@ with st.sidebar:
         st.info("Session cookie file active")
     if resolve_cookies() and not st.session_state.get("uploaded_cookie_path"):
         st.info("Using cookies from secrets")
-    if not resolve_cookies():
-        st.caption("No cookies set. Premium cookies unlock 256kbps AAC.")
 
-tab_search, tab_link = st.tabs(["Search", "Paste link"])
+st.title("Stream Player")
 
-with tab_search:
-    q = st.text_input("Artist or song")
-    if st.button("Search", type="primary") and q.strip():
-        with st.spinner("Searching YouTube Music..."):
-            try:
-                st.session_state.search_results = search_music(q.strip())
-            except Exception as e:
-                st.error(f"Search failed: {e}")
-    for i, tr in enumerate(st.session_state.get("search_results", [])):
-        c0, c1, c2 = st.columns([1, 4, 1])
-        if tr["thumb"]:
-            c0.image(tr["thumb"], width=56)
-        c1.write(f"**{tr['title']}**")
-        if tr["artist"]:
-            c1.caption(tr["artist"])
-        if c2.button("Play", key=f"sr{i}"):
-            st.session_state.queue = st.session_state.search_results
-            st.session_state.current = i
-            st.rerun()
-
-with tab_link:
-    url = st.text_input("YouTube Music link (song or playlist)")
-    if st.button("Load", type="primary") and url.strip():
-        with st.spinner("Reading link..."):
-            try:
-                st.session_state.queue = get_entries(url.strip())
-                st.session_state.current = 0 if st.session_state.queue else None
-                st.rerun()
-            except Exception as e:
-                st.error(f"Could not read this link: {e}")
-
-st.divider()
-
+# ---------------- PLAYER ON TOP ----------------
 if st.session_state.current is not None and st.session_state.queue:
     idx = st.session_state.current
     tr = st.session_state.queue[idx]
@@ -216,68 +294,97 @@ if st.session_state.current is not None and st.session_state.queue:
             st.write(tr["artist"])
         st.toggle("Play all (continue to next track)", key="play_all", value=True)
 
+    has_next = idx < len(st.session_state.queue) - 1
     with st.spinner("Fetching audio..."):
         try:
             path, meta = fetch_audio(tr["id"])
-            ext = os.path.splitext(path)[1].lstrip(".").lower()
-            mime = {"m4a": "audio/mp4", "webm": "audio/webm", "opus": "audio/ogg",
-                    "mp3": "audio/mpeg", "ogg": "audio/ogg"}.get(ext, "audio/mp4")
-            size_mb = os.path.getsize(path) / (1024 * 1024)
-            with open(path, "rb") as f:
-                st.audio(f.read(), format=mime, autoplay=True)
+            render_player(path, meta, st.session_state.get("play_all", True) and has_next)
+
+            size = meta.get("filesize") or os.path.getsize(path)
+            dur = meta.get("duration") or 0
             abr = meta.get("abr")
-            rate = f"{abr:.0f} kbps" if abr else "unknown bitrate"
-            codec = meta.get("acodec") or ext
-            dur = meta.get("duration")
-            dur_s = f" | {int(dur // 60)}:{int(dur % 60):02d}" if dur else ""
-            st.caption(f"{rate} | {codec} | {size_mb:.1f} MB{dur_s} | format {meta.get('format_id')}")
+            real_kbps = (size * 8 / 1000 / dur) if dur else None
+            parts = []
+            parts.append(f"declared bitrate {abr:.0f} kbps" if abr else "declared bitrate unknown")
+            if real_kbps:
+                parts.append(f"real data rate {real_kbps:.0f} kbps")
+            if meta.get("asr"):
+                parts.append(f"sample rate {meta['asr']} Hz")
+            parts.append(f"codec {meta.get('acodec') or '?'}")
+            parts.append(f"container {meta.get('ext') or '?'}")
+            parts.append(f"size {size / (1024*1024):.2f} MB")
+            if dur:
+                parts.append(f"duration {int(dur // 60)}:{int(dur % 60):02d}")
+            fid = meta.get("format_id")
+            note = meta.get("format_note")
+            parts.append(f"format {fid}{' (' + note + ')' if note else ''}")
+            st.caption(" | ".join(parts))
         except Exception as e:
             st.error(f"Playback failed: {e}")
+            if st.session_state.get("play_all", True) and has_next:
+                if st.button("Skip to next"):
+                    st.session_state.current = idx + 1
+                    st.rerun()
 
     p, n = st.columns(2)
     if p.button("Previous", disabled=idx <= 0):
         st.session_state.current = idx - 1
         st.rerun()
-    if n.button("Next", disabled=idx >= len(st.session_state.queue) - 1):
+    if n.button("Next", disabled=not has_next):
         st.session_state.current = idx + 1
         st.rerun()
-
-    has_next = idx < len(st.session_state.queue) - 1
-    if st.session_state.get("play_all") and has_next:
-        import streamlit.components.v1 as components
-        components.html(
-            """
-            <script>
-            const doc = window.parent.document;
-            function hook() {
-              const audios = doc.querySelectorAll('audio');
-              if (!audios.length) { setTimeout(hook, 500); return; }
-              const a = audios[audios.length - 1];
-              if (a.dataset.hooked) return;
-              a.dataset.hooked = '1';
-              a.addEventListener('ended', () => {
-                const btns = doc.querySelectorAll('button');
-                for (const b of btns) {
-                  if (b.innerText.trim() === 'Next' && !b.disabled) { b.click(); break; }
-                }
-              });
-            }
-            hook();
-            </script>
-            """,
-            height=0,
-        )
-
-    if len(st.session_state.queue) > 1:
-        st.write("Queue:")
-        for i, t in enumerate(st.session_state.queue):
-            marker = "▶ " if i == idx else ""
-            c0, c1, c2 = st.columns([1, 4, 1])
-            if t["thumb"]:
-                c0.image(t["thumb"], width=40)
-            c1.write(f"{marker}{t['title']}")
-            if c2.button("Play", key=f"qu{i}"):
-                st.session_state.current = i
-                st.rerun()
 else:
     st.info("Search for an artist or paste a link to start listening.")
+
+st.divider()
+
+# ---------------- SEARCH AND LINK ----------------
+tab_search, tab_link = st.tabs(["Search", "Paste link"])
+
+with tab_search:
+    with st.form("search_form", clear_on_submit=False, border=False):
+        q = st.text_input("Artist or song", placeholder="Type and press Enter")
+        submitted = st.form_submit_button("Search")
+    if submitted and q.strip():
+        with st.spinner("Searching YouTube Music..."):
+            try:
+                st.session_state.search_results = search_music(q.strip())
+            except Exception as e:
+                st.error(f"Search failed: {e}")
+    for i, tr in enumerate(st.session_state.get("search_results", [])):
+        c0, c1 = st.columns([1, 5])
+        if tr["thumb"]:
+            c0.image(tr["thumb"], width=64)
+        label = tr["title"] + (f"  ·  {tr['artist']}" if tr["artist"] else "")
+        if c1.button(label, key=f"sr{i}", use_container_width=True):
+            st.session_state.queue = st.session_state.search_results
+            st.session_state.current = i
+            st.rerun()
+
+with tab_link:
+    with st.form("link_form", clear_on_submit=False, border=False):
+        url = st.text_input("YouTube Music link (song or playlist)",
+                            placeholder="Paste and press Enter")
+        loaded = st.form_submit_button("Load")
+    if loaded and url.strip():
+        with st.spinner("Reading link..."):
+            try:
+                st.session_state.queue = get_entries(url.strip())
+                st.session_state.current = 0 if st.session_state.queue else None
+                st.rerun()
+            except Exception as e:
+                st.error(f"Could not read this link: {e}")
+
+# ---------------- QUEUE ----------------
+if len(st.session_state.queue) > 1:
+    st.divider()
+    st.write("Queue:")
+    idx = st.session_state.current
+    for i, t in enumerate(st.session_state.queue):
+        c0, c1 = st.columns([1, 5])
+        if t["thumb"]:
+            c0.image(t["thumb"], width=48)
+        marker = "▶ " if i == idx else ""
+        if c1.button(f"{marker}{t['title']}", key=f"qu{i}", use_container_width=True):
+            st.session_state.current = i
+            st.rerun()
