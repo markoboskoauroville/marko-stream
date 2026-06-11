@@ -14,31 +14,17 @@ st.set_page_config(page_title="Stream Player", page_icon="🎵", layout="centere
 CACHE_DIR = os.path.join(tempfile.gettempdir(), "stream_player_cache")
 os.makedirs(CACHE_DIR, exist_ok=True)
 
-COOKIE_PATH = os.path.join(tempfile.gettempdir(), "stream_player_cookies.txt")
 LOCAL_COOKIE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies.txt")
 
 
 def resolve_cookies():
-    if st.session_state.get("uploaded_cookie_path"):
-        return st.session_state.uploaded_cookie_path
-    try:
-        secret = st.secrets.get("YT_COOKIES", "")
-    except Exception:
-        secret = ""
-    if secret:
-        with open(COOKIE_PATH, "w") as f:
-            f.write(secret)
-        return COOKIE_PATH
     if os.path.isfile(LOCAL_COOKIE_PATH):
         return LOCAL_COOKIE_PATH
     return None
 
 
 def get_po_token():
-    try:
-        return st.secrets.get("PO_TOKEN", ""), st.secrets.get("VISITOR_DATA", "")
-    except Exception:
-        return "", ""
+    return "", ""
 
 
 CHROME_UA = (
@@ -64,12 +50,7 @@ def with_cookies(opts, extra=None, use_cookies=True):
     }
     o["nocheckcertificate"] = True   # Streamlit Cloud has SSL inspection
     o["geo_bypass_country"] = "HR"
-    try:
-        proxy = st.secrets.get("PROXY_URL", "")
-    except Exception:
-        proxy = ""
-    if proxy:
-        o["proxy"] = proxy
+
     if IMPERSONATE:
         o["impersonate"] = IMPERSONATE
     if extra:
@@ -394,7 +375,7 @@ def parse_cookies_file(path):
 def show_cookie_info():
     path = resolve_cookies()
     if not path or not os.path.exists(path):
-        st.warning("No cookie file found. Upload one below or add YT_COOKIES to secrets.")
+        st.warning("No cookies.txt found in the app folder.")
         return
 
     cookies, err = parse_cookies_file(path)
@@ -490,9 +471,9 @@ def show_cookie_info():
 
     st.write("")
     st.caption(
-        "How to export fresh cookies: in Chrome/Firefox, install the extension "
+        "How to export fresh cookies: in Chrome/Firefox install the extension "
         "'Get cookies.txt LOCALLY', go to youtube.com while logged in, click the extension "
-        "and export for youtube.com. Upload the file here or paste into the YT_COOKIES secret."
+        "and export for youtube.com. Place the file as cookies.txt in the app folder."
     )
 
 
@@ -563,9 +544,8 @@ if st.session_state.current is not None and st.session_state.queue:
                 )
             except Exception:
                 st.warning(
-                    "Probe: video NOT reachable from server region (US). "
-                    "It may be deleted, private, or geo-locked. "
-                    "Add PROXY_URL secret for geo-lock bypass."
+                    "Probe: video NOT reachable. "
+                    "It may be deleted, private, or geo-locked."
                 )
             if st.session_state.get("play_all", True) and has_next:
                 if st.button("Skip to next"):
@@ -627,35 +607,13 @@ with tab_link:
 with tab_setup:
     show_cookie_info()
 
-    st.divider()
-    up = st.file_uploader("Upload cookies.txt (Netscape format)", type=["txt"])
-    if up is not None:
-        path = os.path.join(tempfile.gettempdir(), "uploaded_cookies.txt")
-        with open(path, "wb") as f:
-            f.write(up.getvalue())
-        st.session_state.uploaded_cookie_path = path
-        st.success("Cookie file loaded for this session")
-        st.rerun()
-    elif st.session_state.get("uploaded_cookie_path"):
-        st.info("Session cookie file active")
-        if st.button("Clear session cookies"):
-            st.session_state.uploaded_cookie_path = None
-            st.rerun()
-
-    try:
-        proxy_on = bool(st.secrets.get("PROXY_URL", ""))
-    except Exception:
-        proxy_on = False
+    proxy_on = False
     po_token, visitor_data = get_po_token()
     try:
         from yt_dlp.version import __version__ as ytv
     except Exception:
         ytv = "?"
-    st.caption(
-        f"Proxy: {'active' if proxy_on else 'not set'}  ·  "
-        f"PO Token: {'active' if po_token else 'not set'}  ·  "
-        f"yt-dlp {ytv}  ·  v{VERSION}"
-    )
+    st.caption(f"yt-dlp {ytv}  ·  v{VERSION}")
 
 # ── queue ─────────────────────────────────────────────────────────────────────
 
