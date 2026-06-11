@@ -15,6 +15,7 @@ CACHE_DIR = os.path.join(tempfile.gettempdir(), "stream_player_cache")
 os.makedirs(CACHE_DIR, exist_ok=True)
 
 COOKIE_PATH = os.path.join(tempfile.gettempdir(), "stream_player_cookies.txt")
+LOCAL_COOKIE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies.txt")
 
 
 def resolve_cookies():
@@ -28,6 +29,8 @@ def resolve_cookies():
         with open(COOKIE_PATH, "w") as f:
             f.write(secret)
         return COOKIE_PATH
+    if os.path.isfile(LOCAL_COOKIE_PATH):
+        return LOCAL_COOKIE_PATH
     return None
 
 
