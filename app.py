@@ -6,7 +6,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 import yt_dlp
 
-VERSION = 7
+VERSION = 8
 
 st.set_page_config(page_title="Stream Player", page_icon="🎵", layout="centered")
 
@@ -84,7 +84,7 @@ BASE_OPTS = {
 DL_OPTS = {
     "quiet": True,
     "no_warnings": True,
-    "format": "bestaudio[ext=m4a]/bestaudio/best",
+    "format": "bestaudio*/best",
     "format_sort": ["abr", "asr"],
     "noplaylist": True,
     "ignore_no_formats_error": False,
@@ -160,24 +160,26 @@ def _build_attempts(video_id):
             args["extractor_args"]["youtube"]["visitor_data"] = [visitor_data]
         return args
 
-    base = {"format": "bestaudio[ext=m4a]/bestaudio/best"}
+    # bestaudio* allows video+audio streams as fallback when pure audio formats
+    # are absent for a given client — much more permissive than bestaudio[ext=m4a]
+    base = {"format": "bestaudio*/best"}
 
     attempts = [
-        # android_vr: no PO token needed, JS-less, most reliable on server IPs
+        # always try with cookies first — they bypass bot detection even when
+        # the no-cookie path gets a hard "Sign in to confirm" block
         (wu, {**client("android_vr"), **base}, True),
-        (wu, {**client("android_vr"), **base}, False),   # retry without cookies
-        # web_safari: good fallback, no PO token needed
         (wu, {**client("web_safari"), **base}, True),
-        (wu, {**client("web_safari"), **base}, False),
-        # web: standard web client
-        (wu, {**client("web"), **base}, False),
-        # tv_downgraded: authed client, works well with cookies
         (wu, {**client("tv_downgraded"), **base}, True),
-        (wu, {**client("tv_downgraded"), **base}, False),
-        # web_creator: may bypass age restriction, needs PO token ideally
         (wu, {**client("web_creator", po=True), **base}, True),
-        (wu, {**client("web_creator", po=True), **base}, False),
-        # last resort: no client hint, let yt-dlp decide
+        # music subdomain sometimes has different format availability
+        (mu, {**client("android_vr"), **base}, True),
+        (mu, {**client("web_safari"), **base}, True),
+        # cookieless fallbacks (likely to hit bot detection on datacenter IPs,
+        # but android_vr is JS-less and occasionally slips through)
+        (wu, {**client("android_vr"), **base}, False),
+        (wu, {**client("web_safari"), **base}, False),
+        (wu, {**client("web"), **base}, False),
+        # last resort: no client hint, permissive format, no cookies
         (wu, base, False),
     ]
     return attempts
