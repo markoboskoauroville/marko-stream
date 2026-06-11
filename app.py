@@ -7,7 +7,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 import yt_dlp
 
-VERSION = 12
+VERSION = 13
 
 st.set_page_config(page_title="Stream Player", page_icon="🎵", layout="centered")
 
@@ -23,20 +23,7 @@ def resolve_cookies():
     return None
 
 
-def get_po_token():
-    return "", ""
 
-
-CHROME_UA = (
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
-)
-
-try:
-    from yt_dlp.networking.impersonate import ImpersonateTarget
-    IMPERSONATE = ImpersonateTarget("chrome")
-except Exception:
-    IMPERSONATE = None
 
 
 def with_cookies(opts, extra=None, use_cookies=True):
@@ -44,15 +31,6 @@ def with_cookies(opts, extra=None, use_cookies=True):
     c = resolve_cookies() if use_cookies else None
     if c:
         o["cookiefile"] = c
-    o["http_headers"] = {
-        "User-Agent": CHROME_UA,
-        "Accept-Language": "hr-HR,hr;q=0.9,en;q=0.8",
-    }
-    o["nocheckcertificate"] = True   # Streamlit Cloud has SSL inspection
-    o["geo_bypass_country"] = "HR"
-
-    if IMPERSONATE:
-        o["impersonate"] = IMPERSONATE
     if extra:
         o.update(extra)
     return o
@@ -158,78 +136,17 @@ def pick_best_audio_format(formats):
 
 @st.cache_data(show_spinner=False, max_entries=20)
 def fetch_audio(video_id):
-    """
-    Two-phase download:
-    1. Probe available formats explicitly (no format selector guessing).
-    2. Download with the exact format_id we found.
-    Falls back to format selector strings if probing fails.
-    """
+    """Simple local download: best audio with cookies, one attempt."""
     meta_path = os.path.join(CACHE_DIR, video_id + ".json")
     cached = _find_cached(video_id)
     if cached and os.path.exists(meta_path):
         with open(meta_path) as f:
             return cached, json.load(f)
 
-    # Try music.youtube.com first — many YT Music search results are Music-exclusive
-    mu = f"https://music.youtube.com/watch?v={video_id}"
-    wu = f"https://www.youtube.com/watch?v={video_id}"
-    po_token, visitor_data = get_po_token()
-    errors = []
-
-    fmt_id = None
-    probe_clients = ["android_vr", "web_safari", "tv_downgraded", "web_creator", "web"]
-    for probe_url in (mu, wu):
-        url_label = "music" if "music." in probe_url else "yt"
-        for client in probe_clients:
-            for use_ck in (True, False):
-                extra = {"extractor_args": {"youtube": {"player_client": [client]}}}
-                if po_token and visitor_data and client == "web_creator":
-                    extra["extractor_args"]["youtube"]["po_token"] = [f"web+{po_token}"]
-                    extra["extractor_args"]["youtube"]["visitor_data"] = [visitor_data]
-                opts = with_cookies({
-                    "quiet": True, "no_warnings": True,
-                    "noplaylist": True, "skip_download": True, **extra,
-                }, use_cookies=use_ck)
-                try:
-                    with yt_dlp.YoutubeDL(opts) as ydl:
-                        info = ydl.extract_info(probe_url, download=False)
-                    fmts = info.get("formats") or []
-                    fmt_id = pick_best_audio_format(fmts)
-                    if fmt_id:
-                        break
-                    errors.append(f"probe {url_label}/{client} ({'ck' if use_ck else 'no-ck'}): 0 formats")
-                except Exception as e:
-                    errors.append(f"probe {url_label}/{client} ({'ck' if use_ck else 'no-ck'}): {str(e)[:80]}")
-            if fmt_id:
-                break
-        if fmt_id:
-            break
-
-    fmt_str = f"{fmt_id}/bestaudio*/best" if fmt_id else "bestaudio*/best"
-    info, last_err = None, None
-    for dl_url in (mu, wu):
-        url_label = "music" if "music." in dl_url else "yt"
-        for client in ("android_vr", "web_safari", "tv_downgraded", "web_creator", "web"):
-            for use_ck in (True, False):
-                extra = {"extractor_args": {"youtube": {"player_client": [client]}}}
-                try:
-                    opts = with_cookies({**DL_OPTS_BASE, "format": fmt_str, **extra}, use_cookies=use_ck)
-                    with yt_dlp.YoutubeDL(opts) as ydl:
-                        info = ydl.extract_info(dl_url, download=True)
-                    break
-                except Exception as e:
-                    last_err = e
-                    errors.append(f"dl {url_label}/{client} ({'ck' if use_ck else 'no-ck'}): {str(e)[:80]}")
-            if info:
-                break
-        if info:
-            break
-
-    if info is None:
-        detail = "\n".join(errors)
-        raise RuntimeError(
-            f"All attempts failed. Probed fmt_id={fmt_id!r}\n\n{detail}\n\nLast: {last_err}"
-        )
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    opts = with_cookies({**DL_OPTS_BASE, "format": "bestaudio/best"})
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(url, download=True)
 
     path = _find_cached(video_id)
     if not path:
@@ -432,42 +349,31 @@ def show_cookie_info():
     # Live test
     st.write("Live cookie test — tries multiple clients on a known public video:")
     if st.button("Test cookies now"):
-        TEST_ID = "9bZkp7q19f0"  # Gangnam Style — globally available, no geo-restrictions
-        with st.spinner("Testing clients…"):
-            found = False
-            for test_client in ("web_safari", "tv_downgraded", "android_vr", "web"):
-                try:
-                    opts = with_cookies({
-                        "quiet": True,
-                        "no_warnings": True,
-                        "skip_download": True,
-                        "noplaylist": True,
-                        "format": "bestaudio*/best",
-                        "extractor_args": {"youtube": {"player_client": [test_client]}},
-                    }, use_cookies=True)
-                    with yt_dlp.YoutubeDL(opts) as ydl:
-                        info = ydl.extract_info(
-                            f"https://www.youtube.com/watch?v={TEST_ID}", download=False
-                        )
-                    fmts = info.get("formats") or []
-                    audio_fmts = [f for f in fmts if not f.get("vcodec") or f["vcodec"] == "none"]
-                    best_audio = ""
-                    if audio_fmts:
-                        b = sorted(audio_fmts, key=lambda f: f.get("abr") or 0, reverse=True)[0]
-                        best_audio = f" · best audio: {b.get('format_id')} {b.get('ext')} {b.get('abr') or '?'} kbps {b.get('acodec') or ''}"
-                    st.success(
-                        f"Client '{test_client}' works with your cookies. "
-                        f"Formats: {len(fmts)} total, {len(audio_fmts)} audio-only.{best_audio}"
+        TEST_ID = "9bZkp7q19f0"  # Gangnam Style — globally available
+        with st.spinner("Testing\u2026"):
+            try:
+                opts = with_cookies({
+                    "quiet": True,
+                    "no_warnings": True,
+                    "skip_download": True,
+                    "noplaylist": True,
+                    "format": "bestaudio/best",
+                })
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    info = ydl.extract_info(
+                        f"https://www.youtube.com/watch?v={TEST_ID}", download=False
                     )
-                    found = True
-                    break
-                except Exception as e:
-                    st.caption(f"Client {test_client}: {str(e)[:140]}")
-            if not found:
-                st.error(
-                    "All clients failed. Your cookies may be expired or the server IP "
-                    "is fully blocked by YouTube. Re-export fresh cookies and try again."
+                fmts = info.get("formats") or []
+                audio_fmts = [f for f in fmts if not f.get("vcodec") or f["vcodec"] == "none"]
+                best_audio = ""
+                if audio_fmts:
+                    b = sorted(audio_fmts, key=lambda f: f.get("abr") or 0, reverse=True)[0]
+                    best_audio = f" \u00b7 best audio: {b.get('format_id')} {b.get('ext')} {b.get('abr') or '?'} kbps {b.get('acodec') or ''}"
+                st.success(
+                    f"Cookies work. Formats: {len(fmts)} total, {len(audio_fmts)} audio-only.{best_audio}"
                 )
+            except Exception as e:
+                st.error(f"Test failed: {str(e)[:300]}")
 
     st.write("")
     st.caption(
@@ -531,22 +437,6 @@ if st.session_state.current is not None and st.session_state.queue:
             st.error("Playback failed")
             with st.expander("Show error detail"):
                 st.code(str(e))
-            try:
-                import urllib.request
-                req = urllib.request.Request(
-                    f"https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v={tr['id']}&format=json",
-                    headers={"User-Agent": CHROME_UA})
-                urllib.request.urlopen(req, timeout=8)
-                st.warning(
-                    "Probe: video EXISTS on YouTube from this server region. "
-                    "Problem is likely expired cookies or bot detection. "
-                    "Go to Setup and run the cookie test."
-                )
-            except Exception:
-                st.warning(
-                    "Probe: video NOT reachable. "
-                    "It may be deleted, private, or geo-locked."
-                )
             if st.session_state.get("play_all", True) and has_next:
                 if st.button("Skip to next"):
                     st.session_state.current = idx + 1
@@ -607,8 +497,6 @@ with tab_link:
 with tab_setup:
     show_cookie_info()
 
-    proxy_on = False
-    po_token, visitor_data = get_po_token()
     try:
         from yt_dlp.version import __version__ as ytv
     except Exception:
