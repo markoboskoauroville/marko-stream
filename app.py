@@ -6,7 +6,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 import yt_dlp
 
-VERSION = 6
+VERSION = 7
 
 st.set_page_config(page_title="Stream Player", page_icon="🎵", layout="centered")
 
@@ -30,8 +30,17 @@ def resolve_cookies():
     return None
 
 
-CHROME_UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-             "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
+def get_po_token():
+    try:
+        return st.secrets.get("PO_TOKEN", ""), st.secrets.get("VISITOR_DATA", "")
+    except Exception:
+        return "", ""
+
+
+CHROME_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+)
 
 try:
     from yt_dlp.networking.impersonate import ImpersonateTarget
@@ -45,7 +54,10 @@ def with_cookies(opts, extra=None, use_cookies=True):
     c = resolve_cookies() if use_cookies else None
     if c:
         o["cookiefile"] = c
-    o["http_headers"] = {"User-Agent": CHROME_UA, "Accept-Language": "hr-HR,hr;q=0.9,en;q=0.8"}
+    o["http_headers"] = {
+        "User-Agent": CHROME_UA,
+        "Accept-Language": "hr-HR,hr;q=0.9,en;q=0.8",
+    }
     o["geo_bypass"] = True
     o["geo_bypass_country"] = "HR"
     try:
@@ -72,9 +84,7 @@ BASE_OPTS = {
 DL_OPTS = {
     "quiet": True,
     "no_warnings": True,
-    # prefer premium 256k AAC, then high Opus, then ANY audio, then anything.
-    # the trailing /bestaudio*/best guarantees live tracks without 141 still resolve.
-    "format": "141/256/bestaudio[ext=m4a]/774/251/bestaudio/best",
+    "format": "bestaudio[ext=m4a]/bestaudio/best",
     "format_sort": ["abr", "asr"],
     "noplaylist": True,
     "ignore_no_formats_error": False,
@@ -130,53 +140,86 @@ def _find_cached(video_id):
     return None
 
 
+def _build_attempts(video_id):
+    """
+    Build ordered list of (url, extra_opts, use_cookies) attempts.
+    Uses only client names valid in yt-dlp 2026: android_vr, web_safari,
+    tv_downgraded, web_creator, web.
+    """
+    mu = f"https://music.youtube.com/watch?v={video_id}"
+    wu = f"https://www.youtube.com/watch?v={video_id}"
+
+    po_token, visitor_data = get_po_token()
+
+    def client(name, po=False):
+        args = {"extractor_args": {"youtube": {"player_client": [name]}}}
+        if po and po_token and visitor_data:
+            args["extractor_args"]["youtube"]["po_token"] = [
+                f"web+{po_token}"
+            ]
+            args["extractor_args"]["youtube"]["visitor_data"] = [visitor_data]
+        return args
+
+    base = {"format": "bestaudio[ext=m4a]/bestaudio/best"}
+
+    attempts = [
+        # android_vr: no PO token needed, JS-less, most reliable on server IPs
+        (wu, {**client("android_vr"), **base}, True),
+        (wu, {**client("android_vr"), **base}, False),   # retry without cookies
+        # web_safari: good fallback, no PO token needed
+        (wu, {**client("web_safari"), **base}, True),
+        (wu, {**client("web_safari"), **base}, False),
+        # web: standard web client
+        (wu, {**client("web"), **base}, False),
+        # tv_downgraded: authed client, works well with cookies
+        (wu, {**client("tv_downgraded"), **base}, True),
+        (wu, {**client("tv_downgraded"), **base}, False),
+        # web_creator: may bypass age restriction, needs PO token ideally
+        (wu, {**client("web_creator", po=True), **base}, True),
+        (wu, {**client("web_creator", po=True), **base}, False),
+        # last resort: no client hint, let yt-dlp decide
+        (wu, base, False),
+    ]
+    return attempts
+
+
 @st.cache_data(show_spinner=False, max_entries=20)
 def fetch_audio(video_id):
-    """Download audio in highest quality. Returns (path, meta dict)."""
+    """Download audio. Returns (path, meta dict)."""
     meta_path = os.path.join(CACHE_DIR, video_id + ".json")
     cached = _find_cached(video_id)
     if cached and os.path.exists(meta_path):
         with open(meta_path) as f:
             return cached, json.load(f)
 
-    mu = f"https://music.youtube.com/watch?v={video_id}"
-    wu = f"https://www.youtube.com/watch?v={video_id}"
-
-    def client(name):
-        return {"extractor_args": {"youtube": {"player_client": [name]}},
-                "format": "bestaudio/best"}
-
-    # (url, extra_opts, use_cookies)
-    attempts = [
-        (mu, None, True),
-        (mu, client("web_music"), True),
-        (mu, client("android_music"), True),
-        (wu, client("ios"), True),
-        (wu, client("tv"), True),
-        (wu, client("android_vr"), True),
-        # cookies themselves sometimes cause empty format lists on server IPs,
-        # so retry the strongest clients with cookies stripped
-        (wu, client("tv"), False),
-        (wu, client("android_vr"), False),
-        (wu, client("ios"), False),
-        (wu, {"format": "bestaudio/best"}, False),
-    ]
+    attempts = _build_attempts(video_id)
     info, last_err = None, None
     errors = []
-    for u, extra, use_ck in attempts:
+
+    for i, (u, extra, use_ck) in enumerate(attempts):
+        client_hint = (extra.get("extractor_args", {})
+                            .get("youtube", {})
+                            .get("player_client", ["?"])[0])
         try:
-            with yt_dlp.YoutubeDL(with_cookies(DL_OPTS, extra, use_ck)) as ydl:
+            opts = with_cookies(DL_OPTS, extra, use_ck)
+            with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(u, download=True)
             break
         except Exception as e:
             last_err = e
-            errors.append(str(e)[:80])
+            ck_label = "ck" if use_ck else "no-ck"
+            errors.append(f"[{i+1}] {client_hint} ({ck_label}): {str(e)[:120]}")
+
     if info is None:
-        raise RuntimeError(f"All {len(attempts)} attempts failed. Last: {last_err}")
+        detail = "\n".join(errors)
+        raise RuntimeError(
+            f"All {len(attempts)} attempts failed.\n\n{detail}\n\nLast error: {last_err}"
+        )
 
     path = _find_cached(video_id)
     if not path:
-        raise RuntimeError("Download failed")
+        raise RuntimeError("Download succeeded but file not found in cache")
+
     meta = {
         "abr": info.get("abr"),
         "asr": info.get("asr"),
@@ -193,10 +236,11 @@ def fetch_audio(video_id):
 
 
 def render_player(path, meta, autonext):
-    """Custom HTML player with oscilloscope and waveform, both can be disabled."""
     ext = os.path.splitext(path)[1].lstrip(".").lower()
-    mime = {"m4a": "audio/mp4", "webm": "audio/webm", "opus": "audio/ogg",
-            "mp3": "audio/mpeg", "ogg": "audio/ogg"}.get(ext, "audio/mp4")
+    mime = {
+        "m4a": "audio/mp4", "webm": "audio/webm", "opus": "audio/ogg",
+        "mp3": "audio/mpeg", "ogg": "audio/ogg",
+    }.get(ext, "audio/mp4")
     with open(path, "rb") as f:
         b64 = base64.b64encode(f.read()).decode()
 
@@ -321,7 +365,7 @@ if st.session_state.current is not None and st.session_state.queue:
         st.toggle("Play all (continue to next track)", key="play_all", value=True)
 
     has_next = idx < len(st.session_state.queue) - 1
-    with st.spinner("Fetching audio..."):
+    with st.spinner("Fetching audio…"):
         try:
             path, meta = fetch_audio(tr["id"])
             render_player(path, meta, st.session_state.get("play_all", True) and has_next)
@@ -346,19 +390,27 @@ if st.session_state.current is not None and st.session_state.queue:
             parts.append(f"format {fid}{' (' + note + ')' if note else ''}")
             st.caption(" | ".join(parts))
         except Exception as e:
-            st.error(f"Playback failed: {e}")
+            err_text = str(e)
+            st.error(f"Playback failed")
+            with st.expander("Show error detail"):
+                st.code(err_text)
             try:
                 import urllib.request
                 req = urllib.request.Request(
                     f"https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v={tr['id']}&format=json",
                     headers={"User-Agent": CHROME_UA})
                 urllib.request.urlopen(req, timeout=8)
-                st.warning("Probe: this video EXISTS from the server region. "
-                           "The block is account, cookie or client related, not geo.")
+                st.warning(
+                    "Probe: this video EXISTS from the server region. "
+                    "The block is client, cookie or bot-detection related. "
+                    "Upload fresh cookies in Setup, or add PO_TOKEN + VISITOR_DATA secrets."
+                )
             except Exception:
-                st.warning("Probe: this video is NOT publicly reachable from the server "
-                           "region (US). It is deleted, private, or geo locked to certain "
-                           "countries. A proxy in PROXY_URL secret is the only fix for geo locks.")
+                st.warning(
+                    "Probe: this video is NOT publicly reachable from the server region (US). "
+                    "It may be deleted, private, or geo-locked. "
+                    "A proxy in PROXY_URL secret is the only fix for geo locks."
+                )
             if st.session_state.get("play_all", True) and has_next:
                 if st.button("Skip to next"):
                     st.session_state.current = idx + 1
@@ -384,7 +436,7 @@ with tab_search:
         q = st.text_input("Artist or song", placeholder="Type and press Enter")
         submitted = st.form_submit_button("Search")
     if submitted and q.strip():
-        with st.spinner("Searching YouTube Music..."):
+        with st.spinner("Searching YouTube Music…"):
             try:
                 st.session_state.search_results = search_music(q.strip())
             except Exception as e:
@@ -401,11 +453,13 @@ with tab_search:
 
 with tab_link:
     with st.form("link_form", clear_on_submit=False, border=False):
-        url = st.text_input("YouTube Music link (song or playlist)",
-                            placeholder="Paste and press Enter")
+        url = st.text_input(
+            "YouTube Music link (song or playlist)",
+            placeholder="Paste and press Enter",
+        )
         loaded = st.form_submit_button("Load")
     if loaded and url.strip():
-        with st.spinner("Reading link..."):
+        with st.spinner("Reading link…"):
             try:
                 st.session_state.queue = get_entries(url.strip())
                 st.session_state.current = 0 if st.session_state.queue else None
@@ -427,7 +481,17 @@ with tab_setup:
     if resolve_cookies() and not st.session_state.get("uploaded_cookie_path"):
         st.info("Using cookies from secrets")
     if not resolve_cookies():
-        st.caption("No cookies set. Premium cookies unlock 256kbps AAC.")
+        st.caption("No cookies set. Fresh YouTube cookies unlock 256 kbps AAC and reduce bot detection.")
+
+    po_token, visitor_data = get_po_token()
+    if po_token and visitor_data:
+        st.success("PO Token and Visitor Data active (web_creator client enabled)")
+    else:
+        st.caption(
+            "No PO_TOKEN / VISITOR_DATA secrets. "
+            "Add these in Streamlit Cloud secrets to enable web_creator client fallback."
+        )
+
     try:
         proxy_on = bool(st.secrets.get("PROXY_URL", ""))
     except Exception:
@@ -436,7 +500,10 @@ with tab_setup:
         from yt_dlp.version import __version__ as ytv
     except Exception:
         ytv = "?"
-    st.caption(f"Proxy: {'active' if proxy_on else 'not set'}  ·  yt-dlp {ytv}  ·  v{VERSION}")
+    st.caption(
+        f"Proxy: {'active' if proxy_on else 'not set'}  ·  yt-dlp {ytv}  ·  v{VERSION}  ·  "
+        f"Clients: android_vr, web_safari, web, tv_downgraded, web_creator"
+    )
 
 # ---------------- QUEUE ----------------
 if len(st.session_state.queue) > 1:
