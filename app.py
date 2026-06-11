@@ -7,7 +7,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 import yt_dlp
 
-VERSION = 11
+VERSION = 12
 
 st.set_page_config(page_title="Stream Player", page_icon="🎵", layout="centered")
 
