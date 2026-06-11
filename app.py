@@ -7,7 +7,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 import yt_dlp
 
-VERSION = 13
+VERSION = 14
 
 st.set_page_config(page_title="Stream Player", page_icon="🎵", layout="centered")
 
@@ -144,9 +144,26 @@ def fetch_audio(video_id):
             return cached, json.load(f)
 
     url = f"https://www.youtube.com/watch?v={video_id}"
-    opts = with_cookies({**DL_OPTS_BASE, "format": "bestaudio/best"})
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(url, download=True)
+    info = None
+    errors = []
+    attempts = [
+        None,                # default web client
+        ["android_vr"],      # no PO token required
+        ["tv"],              # second fallback
+    ]
+    for clients in attempts:
+        extra = {"format": "bestaudio*/best"}
+        if clients:
+            extra["extractor_args"] = {"youtube": {"player_client": clients}}
+        try:
+            opts = with_cookies({**DL_OPTS_BASE, **extra})
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+            break
+        except Exception as e:
+            errors.append(f"{clients or 'web'}: {str(e)[:120]}")
+    if info is None:
+        raise RuntimeError("All attempts failed:\n" + "\n".join(errors))
 
     path = _find_cached(video_id)
     if not path:
