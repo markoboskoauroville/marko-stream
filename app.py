@@ -28,11 +28,26 @@ def resolve_cookies():
     return None
 
 
+CHROME_UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+             "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
+
+try:
+    from yt_dlp.networking.impersonate import ImpersonateTarget
+    IMPERSONATE = ImpersonateTarget("chrome")
+except Exception:
+    IMPERSONATE = None
+
+
 def with_cookies(opts, extra=None):
     o = dict(opts)
     c = resolve_cookies()
     if c:
         o["cookiefile"] = c
+    o["http_headers"] = {"User-Agent": CHROME_UA, "Accept-Language": "hr-HR,hr;q=0.9,en;q=0.8"}
+    o["geo_bypass"] = True
+    o["geo_bypass_country"] = "HR"
+    if IMPERSONATE:
+        o["impersonate"] = IMPERSONATE
     if extra:
         o.update(extra)
     return o
@@ -113,15 +128,14 @@ def fetch_audio(video_id):
         with open(meta_path) as f:
             return cached, json.load(f)
 
+    mu = f"https://music.youtube.com/watch?v={video_id}"
     attempts = [
-        (f"https://music.youtube.com/watch?v={video_id}", None),
-        (f"https://www.youtube.com/watch?v={video_id}", None),
-        (f"https://www.youtube.com/watch?v={video_id}",
-         {"extractor_args": {"youtube": {"player_client": ["android"]}},
-          "format": "bestaudio/best"}),
-        (f"https://www.youtube.com/watch?v={video_id}",
-         {"extractor_args": {"youtube": {"player_client": ["ios"]}},
-          "format": "bestaudio/best"}),
+        (mu, None),
+        (mu, {"extractor_args": {"youtube": {"player_client": ["web_music"]}}}),
+        (mu, {"extractor_args": {"youtube": {"player_client": ["android_music"]}},
+              "format": "bestaudio/best"}),
+        (mu, {"extractor_args": {"youtube": {"player_client": ["ios"]}},
+              "format": "bestaudio/best"}),
     ]
     info, last_err = None, None
     for u, extra in attempts:
