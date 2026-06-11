@@ -2,11 +2,12 @@ import os
 import json
 import base64
 import tempfile
+import datetime
 import streamlit as st
 import streamlit.components.v1 as components
 import yt_dlp
 
-VERSION = 8
+VERSION = 9
 
 st.set_page_config(page_title="Stream Player", page_icon="🎵", layout="centered")
 
@@ -81,13 +82,10 @@ BASE_OPTS = {
     "skip_download": True,
 }
 
-DL_OPTS = {
+DL_OPTS_BASE = {
     "quiet": True,
     "no_warnings": True,
-    "format": "bestaudio*/best",
-    "format_sort": ["abr", "asr"],
     "noplaylist": True,
-    "ignore_no_formats_error": False,
     "outtmpl": os.path.join(CACHE_DIR, "%(id)s.%(ext)s"),
 }
 
@@ -140,82 +138,111 @@ def _find_cached(video_id):
     return None
 
 
-def _build_attempts(video_id):
+def probe_formats(video_id, use_cookies=True):
+    """Return list of available formats for a video ID, or raise."""
+    opts = with_cookies({
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "skip_download": True,
+    }, use_cookies=use_cookies)
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(
+            f"https://www.youtube.com/watch?v={video_id}", download=False
+        )
+    return info.get("formats") or []
+
+
+def pick_best_audio_format(formats):
     """
-    Build ordered list of (url, extra_opts, use_cookies) attempts.
-    Uses only client names valid in yt-dlp 2026: android_vr, web_safari,
-    tv_downgraded, web_creator, web.
+    Pick the best audio-only format by bitrate.
+    Falls back to any format with audio if no audio-only exists.
+    Returns format id string or None.
     """
-    mu = f"https://music.youtube.com/watch?v={video_id}"
-    wu = f"https://www.youtube.com/watch?v={video_id}"
-
-    po_token, visitor_data = get_po_token()
-
-    def client(name, po=False):
-        args = {"extractor_args": {"youtube": {"player_client": [name]}}}
-        if po and po_token and visitor_data:
-            args["extractor_args"]["youtube"]["po_token"] = [
-                f"web+{po_token}"
-            ]
-            args["extractor_args"]["youtube"]["visitor_data"] = [visitor_data]
-        return args
-
-    # bestaudio* allows video+audio streams as fallback when pure audio formats
-    # are absent for a given client — much more permissive than bestaudio[ext=m4a]
-    base = {"format": "bestaudio*/best"}
-
-    attempts = [
-        # always try with cookies first — they bypass bot detection even when
-        # the no-cookie path gets a hard "Sign in to confirm" block
-        (wu, {**client("android_vr"), **base}, True),
-        (wu, {**client("web_safari"), **base}, True),
-        (wu, {**client("tv_downgraded"), **base}, True),
-        (wu, {**client("web_creator", po=True), **base}, True),
-        # music subdomain sometimes has different format availability
-        (mu, {**client("android_vr"), **base}, True),
-        (mu, {**client("web_safari"), **base}, True),
-        # cookieless fallbacks (likely to hit bot detection on datacenter IPs,
-        # but android_vr is JS-less and occasionally slips through)
-        (wu, {**client("android_vr"), **base}, False),
-        (wu, {**client("web_safari"), **base}, False),
-        (wu, {**client("web"), **base}, False),
-        # last resort: no client hint, permissive format, no cookies
-        (wu, base, False),
-    ]
-    return attempts
+    audio_only = [f for f in formats if not f.get("vcodec") or f["vcodec"] == "none"]
+    pool = audio_only if audio_only else formats
+    if not pool:
+        return None
+    # sort by abr descending, then filesize descending
+    pool_sorted = sorted(
+        pool,
+        key=lambda f: (f.get("abr") or 0, f.get("filesize") or 0),
+        reverse=True,
+    )
+    return pool_sorted[0]["format_id"]
 
 
 @st.cache_data(show_spinner=False, max_entries=20)
 def fetch_audio(video_id):
-    """Download audio. Returns (path, meta dict)."""
+    """
+    Two-phase download:
+    1. Probe available formats explicitly (no format selector guessing).
+    2. Download with the exact format_id we found.
+    Falls back to format selector strings if probing fails.
+    """
     meta_path = os.path.join(CACHE_DIR, video_id + ".json")
     cached = _find_cached(video_id)
     if cached and os.path.exists(meta_path):
         with open(meta_path) as f:
             return cached, json.load(f)
 
-    attempts = _build_attempts(video_id)
-    info, last_err = None, None
+    wu = f"https://www.youtube.com/watch?v={video_id}"
+    po_token, visitor_data = get_po_token()
     errors = []
 
-    for i, (u, extra, use_ck) in enumerate(attempts):
-        client_hint = (extra.get("extractor_args", {})
-                            .get("youtube", {})
-                            .get("player_client", ["?"])[0])
-        try:
-            opts = with_cookies(DL_OPTS, extra, use_ck)
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(u, download=True)
+    # Phase 1: probe formats
+    fmt_id = None
+    probe_clients = ["android_vr", "web_safari", "tv_downgraded", "web_creator", "web"]
+    for client in probe_clients:
+        for use_ck in (True, False):
+            extra = {"extractor_args": {"youtube": {"player_client": [client]}}}
+            if po_token and visitor_data and client == "web_creator":
+                extra["extractor_args"]["youtube"]["po_token"] = [f"web+{po_token}"]
+                extra["extractor_args"]["youtube"]["visitor_data"] = [visitor_data]
+            opts = with_cookies({
+                "quiet": True,
+                "no_warnings": True,
+                "noplaylist": True,
+                "skip_download": True,
+                **extra,
+            }, use_cookies=use_ck)
+            try:
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    info = ydl.extract_info(wu, download=False)
+                fmts = info.get("formats") or []
+                fmt_id = pick_best_audio_format(fmts)
+                if fmt_id:
+                    break
+                errors.append(f"probe {client} ({'ck' if use_ck else 'no-ck'}): 0 formats returned")
+            except Exception as e:
+                errors.append(f"probe {client} ({'ck' if use_ck else 'no-ck'}): {str(e)[:100]}")
+        if fmt_id:
             break
-        except Exception as e:
-            last_err = e
-            ck_label = "ck" if use_ck else "no-ck"
-            errors.append(f"[{i+1}] {client_hint} ({ck_label}): {str(e)[:120]}")
+
+    # Phase 2: download
+    dl_clients = ["android_vr", "web_safari", "tv_downgraded", "web_creator", "web"]
+    # build format string: explicit id first, then permissive fallbacks
+    fmt_str = f"{fmt_id}/bestaudio*/best" if fmt_id else "bestaudio*/best"
+
+    info, last_err = None, None
+    for client in dl_clients:
+        for use_ck in (True, False):
+            extra = {"extractor_args": {"youtube": {"player_client": [client]}}}
+            try:
+                opts = with_cookies({**DL_OPTS_BASE, "format": fmt_str, **extra}, use_cookies=use_ck)
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    info = ydl.extract_info(wu, download=True)
+                break
+            except Exception as e:
+                last_err = e
+                errors.append(f"dl {client} ({'ck' if use_ck else 'no-ck'}): {str(e)[:100]}")
+        if info:
+            break
 
     if info is None:
         detail = "\n".join(errors)
         raise RuntimeError(
-            f"All {len(attempts)} attempts failed.\n\n{detail}\n\nLast error: {last_err}"
+            f"All attempts failed. Probed fmt_id={fmt_id!r}\n\n{detail}\n\nLast: {last_err}"
         )
 
     path = _find_cached(video_id)
@@ -265,7 +292,6 @@ const waveC = document.getElementById('wave'), oscC = document.getElementById('o
 const wctx = waveC.getContext('2d'), octx = oscC.getContext('2d');
 const cbW = document.getElementById('cb_wave'), cbO = document.getElementById('cb_osc');
 let actx = null, analyser = null, peaks = null;
-
 function setup() {
   if (actx) return;
   actx = new (window.AudioContext || window.webkitAudioContext)();
@@ -280,61 +306,44 @@ function setup() {
     peaks = [];
     for (let i = 0; i < n; i++) {
       let max = 0;
-      for (let j = 0; j < step; j += 16) {
-        const v = Math.abs(data[i * step + j] || 0);
-        if (v > max) max = v;
-      }
+      for (let j = 0; j < step; j += 16) { const v = Math.abs(data[i*step+j]||0); if(v>max)max=v; }
       peaks.push(max);
     }
   }).catch(()=>{});
 }
-
 function drawWave() {
   wctx.clearRect(0,0,waveC.width,waveC.height);
-  if (!cbW.checked) return;
-  if (!peaks) return;
-  const h = waveC.height, mid = h/2;
-  const prog = au.duration ? au.currentTime / au.duration : 0;
-  for (let i = 0; i < peaks.length; i++) {
-    const ph = Math.max(2, peaks[i] * (h - 8));
-    wctx.fillStyle = (i / peaks.length) <= prog ? '#e05a00' : '#444';
-    wctx.fillRect(i, mid - ph/2, 1, ph);
+  if (!cbW.checked||!peaks) return;
+  const h=waveC.height, mid=h/2, prog=au.duration?au.currentTime/au.duration:0;
+  for(let i=0;i<peaks.length;i++){
+    const ph=Math.max(2,peaks[i]*(h-8));
+    wctx.fillStyle=(i/peaks.length)<=prog?'#e05a00':'#444';
+    wctx.fillRect(i,mid-ph/2,1,ph);
   }
 }
-
 function drawOsc() {
   octx.clearRect(0,0,oscC.width,oscC.height);
-  if (!cbO.checked || !analyser) return;
-  const arr = new Uint8Array(analyser.fftSize);
+  if(!cbO.checked||!analyser)return;
+  const arr=new Uint8Array(analyser.fftSize);
   analyser.getByteTimeDomainData(arr);
-  octx.strokeStyle = '#e05a00';
-  octx.lineWidth = 2;
-  octx.beginPath();
-  const sw = oscC.width / arr.length;
-  for (let i = 0; i < arr.length; i++) {
-    const y = (arr[i] / 255) * oscC.height;
-    if (i === 0) octx.moveTo(0, y); else octx.lineTo(i * sw, y);
-  }
+  octx.strokeStyle='#e05a00'; octx.lineWidth=2; octx.beginPath();
+  const sw=oscC.width/arr.length;
+  for(let i=0;i<arr.length;i++){const y=(arr[i]/255)*oscC.height;if(i===0)octx.moveTo(0,y);else octx.lineTo(i*sw,y);}
   octx.stroke();
 }
-
-function loop() { drawWave(); drawOsc(); requestAnimationFrame(loop); }
+function loop(){drawWave();drawOsc();requestAnimationFrame(loop);}
 loop();
-
-au.addEventListener('play', () => { setup(); if (actx) actx.resume(); });
-waveC.addEventListener('click', (e) => {
-  if (!au.duration) return;
-  const r = waveC.getBoundingClientRect();
-  au.currentTime = ((e.clientX - r.left) / r.width) * au.duration;
+au.addEventListener('play',()=>{setup();if(actx)actx.resume();});
+waveC.addEventListener('click',(e)=>{
+  if(!au.duration)return;
+  const r=waveC.getBoundingClientRect();
+  au.currentTime=((e.clientX-r.left)/r.width)*au.duration;
 });
-
-const AUTONEXT = %AUTONEXT%;
-au.addEventListener('ended', () => {
-  if (!AUTONEXT) return;
-  const btns = window.parent.document.querySelectorAll('button');
-  for (const b of btns) {
-    if (b.innerText.trim() === 'Next' && !b.disabled) { b.click(); break; }
-  }
+const AUTONEXT=%AUTONEXT%;
+au.addEventListener('ended',()=>{
+  if(!AUTONEXT)return;
+  const btns=window.parent.document.querySelectorAll('button');
+  for(const b of btns){if(b.innerText.trim()==='Next'&&!b.disabled){b.click();break;}}
 });
 </script>
 """
@@ -344,6 +353,144 @@ au.addEventListener('ended', () => {
     components.html(html, height=300)
 
 
+# ── cookie inspector ──────────────────────────────────────────────────────────
+
+def parse_cookies_file(path):
+    """Parse Netscape cookies.txt and return list of dicts."""
+    cookies = []
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split("\t")
+                if len(parts) < 7:
+                    continue
+                domain, flag, path_, secure, expires, name, value = parts[:7]
+                try:
+                    exp_ts = int(expires)
+                    exp_dt = datetime.datetime.utcfromtimestamp(exp_ts) if exp_ts > 0 else None
+                except Exception:
+                    exp_dt = None
+                cookies.append({
+                    "domain": domain,
+                    "path": path_,
+                    "secure": flag.upper() == "TRUE",
+                    "expires": exp_dt,
+                    "name": name,
+                    "value_len": len(value),
+                })
+    except Exception as e:
+        return [], str(e)
+    return cookies, None
+
+
+def show_cookie_info():
+    path = resolve_cookies()
+    if not path or not os.path.exists(path):
+        st.warning("No cookie file found. Upload one below or add YT_COOKIES to secrets.")
+        return
+
+    cookies, err = parse_cookies_file(path)
+    if err:
+        st.error(f"Could not parse cookies file: {err}")
+        return
+
+    now = datetime.datetime.utcnow()
+    yt_cookies = [c for c in cookies if "youtube" in c["domain"] or "google" in c["domain"]]
+
+    st.write(f"Total cookies in file: {len(cookies)}, YouTube/Google cookies: {len(yt_cookies)}")
+
+    expired_count = sum(1 for c in yt_cookies if c["expires"] and c["expires"] < now)
+    valid_count = sum(1 for c in yt_cookies if c["expires"] and c["expires"] >= now)
+    no_expiry_count = sum(1 for c in yt_cookies if not c["expires"])
+
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Valid", valid_count, delta=None)
+    col2.metric("Expired", expired_count, delta=None)
+    col3.metric("No expiry", no_expiry_count, delta=None)
+
+    # Key auth cookies
+    key_names = {"SAPISID", "HSID", "SSID", "SID", "APISID", "__Secure-3PSID",
+                 "__Secure-3PAPISID", "LOGIN_INFO", "VISITOR_INFO1_LIVE", "YSC"}
+    found_keys = {c["name"] for c in yt_cookies if c["name"] in key_names}
+    missing_keys = key_names - found_keys
+
+    if found_keys:
+        st.success(f"Auth cookies present: {', '.join(sorted(found_keys))}")
+    if missing_keys:
+        st.warning(f"Auth cookies missing: {', '.join(sorted(missing_keys))}")
+
+    # Expiry timeline
+    with st.expander("All YouTube/Google cookies"):
+        rows = []
+        for c in sorted(yt_cookies, key=lambda x: x["domain"] + x["name"]):
+            if c["expires"]:
+                days_left = (c["expires"] - now).days
+                exp_str = c["expires"].strftime("%Y-%m-%d") + f"  ({days_left}d)"
+                status = "✅" if days_left > 0 else "❌ EXPIRED"
+            else:
+                exp_str = "session / no expiry"
+                status = "✅"
+            rows.append({
+                "status": status,
+                "name": c["name"],
+                "domain": c["domain"],
+                "expires": exp_str,
+                "secure": "🔒" if c["secure"] else "",
+                "value_len": c["value_len"],
+            })
+        st.table(rows)
+
+    # Live test
+    st.write("Live cookie test — tries to resolve a known public video with your cookies:")
+    if st.button("Test cookies now"):
+        TEST_ID = "jNQXAC9IVRw"  # "Me at the zoo" — first ever YouTube video, always public
+        with st.spinner("Testing…"):
+            try:
+                opts = with_cookies({
+                    "quiet": True,
+                    "no_warnings": True,
+                    "skip_download": True,
+                    "noplaylist": True,
+                }, use_cookies=True)
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    info = ydl.extract_info(
+                        f"https://www.youtube.com/watch?v={TEST_ID}", download=False
+                    )
+                fmts = info.get("formats") or []
+                audio_fmts = [f for f in fmts if not f.get("vcodec") or f["vcodec"] == "none"]
+                st.success(
+                    f"Cookies work. Title: '{info.get('title')}'. "
+                    f"Total formats: {len(fmts)}, audio-only: {len(audio_fmts)}."
+                )
+                if audio_fmts:
+                    best = sorted(audio_fmts, key=lambda f: f.get("abr") or 0, reverse=True)[0]
+                    st.info(
+                        f"Best audio format: {best.get('format_id')} "
+                        f"{best.get('ext')} {best.get('abr') or '?'} kbps "
+                        f"{best.get('acodec') or ''}"
+                    )
+            except Exception as e:
+                err = str(e)
+                if "Sign in" in err or "bot" in err.lower():
+                    st.error("Cookies rejected by YouTube (bot detection or session expired). Re-export fresh cookies from your browser.")
+                elif "format" in err.lower():
+                    st.error(f"Connected but no formats available: {err}")
+                else:
+                    st.error(f"Test failed: {err}")
+
+    st.write("")
+    st.caption(
+        "How to export fresh cookies: in Chrome/Firefox, install the extension "
+        "'Get cookies.txt LOCALLY', go to youtube.com while logged in, click the extension "
+        "and export for youtube.com. Upload the file here or paste into the YT_COOKIES secret."
+    )
+
+
+# ── session state ─────────────────────────────────────────────────────────────
+
 if "queue" not in st.session_state:
     st.session_state.queue = []
 if "current" not in st.session_state:
@@ -351,7 +498,8 @@ if "current" not in st.session_state:
 
 st.caption(f"v{VERSION}")
 
-# ---------------- PLAYER ON TOP ----------------
+# ── player ────────────────────────────────────────────────────────────────────
+
 if st.session_state.current is not None and st.session_state.queue:
     idx = st.session_state.current
     tr = st.session_state.queue[idx]
@@ -392,10 +540,9 @@ if st.session_state.current is not None and st.session_state.queue:
             parts.append(f"format {fid}{' (' + note + ')' if note else ''}")
             st.caption(" | ".join(parts))
         except Exception as e:
-            err_text = str(e)
-            st.error(f"Playback failed")
+            st.error("Playback failed")
             with st.expander("Show error detail"):
-                st.code(err_text)
+                st.code(str(e))
             try:
                 import urllib.request
                 req = urllib.request.Request(
@@ -403,15 +550,15 @@ if st.session_state.current is not None and st.session_state.queue:
                     headers={"User-Agent": CHROME_UA})
                 urllib.request.urlopen(req, timeout=8)
                 st.warning(
-                    "Probe: this video EXISTS from the server region. "
-                    "The block is client, cookie or bot-detection related. "
-                    "Upload fresh cookies in Setup, or add PO_TOKEN + VISITOR_DATA secrets."
+                    "Probe: video EXISTS on YouTube from this server region. "
+                    "Problem is likely expired cookies or bot detection. "
+                    "Go to Setup and run the cookie test."
                 )
             except Exception:
                 st.warning(
-                    "Probe: this video is NOT publicly reachable from the server region (US). "
+                    "Probe: video NOT reachable from server region (US). "
                     "It may be deleted, private, or geo-locked. "
-                    "A proxy in PROXY_URL secret is the only fix for geo locks."
+                    "Add PROXY_URL secret for geo-lock bypass."
                 )
             if st.session_state.get("play_all", True) and has_next:
                 if st.button("Skip to next"):
@@ -430,7 +577,8 @@ else:
 
 st.divider()
 
-# ---------------- SEARCH, LINK, SETUP ----------------
+# ── tabs ──────────────────────────────────────────────────────────────────────
+
 tab_search, tab_link, tab_setup = st.tabs(["Search", "Paste link", "Setup"])
 
 with tab_search:
@@ -470,7 +618,9 @@ with tab_link:
                 st.error(f"Could not read this link: {e}")
 
 with tab_setup:
-    st.write("Cookies")
+    show_cookie_info()
+
+    st.divider()
     up = st.file_uploader("Upload cookies.txt (Netscape format)", type=["txt"])
     if up is not None:
         path = os.path.join(tempfile.gettempdir(), "uploaded_cookies.txt")
@@ -478,36 +628,30 @@ with tab_setup:
             f.write(up.getvalue())
         st.session_state.uploaded_cookie_path = path
         st.success("Cookie file loaded for this session")
+        st.rerun()
     elif st.session_state.get("uploaded_cookie_path"):
         st.info("Session cookie file active")
-    if resolve_cookies() and not st.session_state.get("uploaded_cookie_path"):
-        st.info("Using cookies from secrets")
-    if not resolve_cookies():
-        st.caption("No cookies set. Fresh YouTube cookies unlock 256 kbps AAC and reduce bot detection.")
-
-    po_token, visitor_data = get_po_token()
-    if po_token and visitor_data:
-        st.success("PO Token and Visitor Data active (web_creator client enabled)")
-    else:
-        st.caption(
-            "No PO_TOKEN / VISITOR_DATA secrets. "
-            "Add these in Streamlit Cloud secrets to enable web_creator client fallback."
-        )
+        if st.button("Clear session cookies"):
+            st.session_state.uploaded_cookie_path = None
+            st.rerun()
 
     try:
         proxy_on = bool(st.secrets.get("PROXY_URL", ""))
     except Exception:
         proxy_on = False
+    po_token, visitor_data = get_po_token()
     try:
         from yt_dlp.version import __version__ as ytv
     except Exception:
         ytv = "?"
     st.caption(
-        f"Proxy: {'active' if proxy_on else 'not set'}  ·  yt-dlp {ytv}  ·  v{VERSION}  ·  "
-        f"Clients: android_vr, web_safari, web, tv_downgraded, web_creator"
+        f"Proxy: {'active' if proxy_on else 'not set'}  ·  "
+        f"PO Token: {'active' if po_token else 'not set'}  ·  "
+        f"yt-dlp {ytv}  ·  v{VERSION}"
     )
 
-# ---------------- QUEUE ----------------
+# ── queue ─────────────────────────────────────────────────────────────────────
+
 if len(st.session_state.queue) > 1:
     st.divider()
     st.write("Queue:")
