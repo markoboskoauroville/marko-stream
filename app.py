@@ -6,7 +6,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 import yt_dlp
 
-VERSION = 4
+VERSION = 5
 
 st.set_page_config(page_title="Stream Player", page_icon="🎵", layout="centered")
 
@@ -72,9 +72,12 @@ BASE_OPTS = {
 DL_OPTS = {
     "quiet": True,
     "no_warnings": True,
-    "format": "141/774/bestaudio[ext=m4a]/bestaudio/best",
+    # prefer premium 256k AAC, then high Opus, then ANY audio, then anything.
+    # the trailing /bestaudio*/best guarantees live tracks without 141 still resolve.
+    "format": "141/256/bestaudio[ext=m4a]/774/251/bestaudio/best",
     "format_sort": ["abr", "asr"],
     "noplaylist": True,
+    "ignore_no_formats_error": False,
     "outtmpl": os.path.join(CACHE_DIR, "%(id)s.%(ext)s"),
 }
 
@@ -137,13 +140,15 @@ def fetch_audio(video_id):
             return cached, json.load(f)
 
     mu = f"https://music.youtube.com/watch?v={video_id}"
+    wu = f"https://www.youtube.com/watch?v={video_id}"
     attempts = [
         (mu, None),
         (mu, {"extractor_args": {"youtube": {"player_client": ["web_music"]}}}),
         (mu, {"extractor_args": {"youtube": {"player_client": ["android_music"]}},
               "format": "bestaudio/best"}),
-        (mu, {"extractor_args": {"youtube": {"player_client": ["ios"]}},
+        (wu, {"extractor_args": {"youtube": {"player_client": ["ios"]}},
               "format": "bestaudio/best"}),
+        (wu, {"format": "bestaudio/best"}),
     ]
     info, last_err = None, None
     for u, extra in attempts:
@@ -285,23 +290,6 @@ if "queue" not in st.session_state:
 if "current" not in st.session_state:
     st.session_state.current = None
 
-with st.sidebar:
-    st.subheader("Cookies")
-    up = st.file_uploader("Upload cookies.txt (Netscape format)", type=["txt"])
-    if up is not None:
-        path = os.path.join(tempfile.gettempdir(), "uploaded_cookies.txt")
-        with open(path, "wb") as f:
-            f.write(up.getvalue())
-        st.session_state.uploaded_cookie_path = path
-        st.success("Cookie file loaded for this session")
-    elif st.session_state.get("uploaded_cookie_path"):
-        st.info("Session cookie file active")
-    if resolve_cookies() and not st.session_state.get("uploaded_cookie_path"):
-        st.info("Using cookies from secrets")
-
-st.title("Stream Player")
-st.caption(f"v{VERSION}")
-
 # ---------------- PLAYER ON TOP ----------------
 if st.session_state.current is not None and st.session_state.queue:
     idx = st.session_state.current
@@ -373,8 +361,8 @@ else:
 
 st.divider()
 
-# ---------------- SEARCH AND LINK ----------------
-tab_search, tab_link = st.tabs(["Search", "Paste link"])
+# ---------------- SEARCH, LINK, SETUP ----------------
+tab_search, tab_link, tab_setup = st.tabs(["Search", "Paste link", "Setup"])
 
 with tab_search:
     with st.form("search_form", clear_on_submit=False, border=False):
@@ -409,6 +397,27 @@ with tab_link:
                 st.rerun()
             except Exception as e:
                 st.error(f"Could not read this link: {e}")
+
+with tab_setup:
+    st.write("Cookies")
+    up = st.file_uploader("Upload cookies.txt (Netscape format)", type=["txt"])
+    if up is not None:
+        path = os.path.join(tempfile.gettempdir(), "uploaded_cookies.txt")
+        with open(path, "wb") as f:
+            f.write(up.getvalue())
+        st.session_state.uploaded_cookie_path = path
+        st.success("Cookie file loaded for this session")
+    elif st.session_state.get("uploaded_cookie_path"):
+        st.info("Session cookie file active")
+    if resolve_cookies() and not st.session_state.get("uploaded_cookie_path"):
+        st.info("Using cookies from secrets")
+    if not resolve_cookies():
+        st.caption("No cookies set. Premium cookies unlock 256kbps AAC.")
+    try:
+        proxy_on = bool(st.secrets.get("PROXY_URL", ""))
+    except Exception:
+        proxy_on = False
+    st.caption(f"Proxy: {'active' if proxy_on else 'not set'}  ·  v{VERSION}")
 
 # ---------------- QUEUE ----------------
 if len(st.session_state.queue) > 1:
