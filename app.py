@@ -7,7 +7,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 import yt_dlp
 
-VERSION = 10
+VERSION = 11
 
 st.set_page_config(page_title="Stream Player", page_icon="🎵", layout="centered")
 
@@ -186,56 +186,58 @@ def fetch_audio(video_id):
         with open(meta_path) as f:
             return cached, json.load(f)
 
+    # Try music.youtube.com first — many YT Music search results are Music-exclusive
+    mu = f"https://music.youtube.com/watch?v={video_id}"
     wu = f"https://www.youtube.com/watch?v={video_id}"
     po_token, visitor_data = get_po_token()
     errors = []
 
-    # Phase 1: probe formats
     fmt_id = None
     probe_clients = ["android_vr", "web_safari", "tv_downgraded", "web_creator", "web"]
-    for client in probe_clients:
-        for use_ck in (True, False):
-            extra = {"extractor_args": {"youtube": {"player_client": [client]}}}
-            if po_token and visitor_data and client == "web_creator":
-                extra["extractor_args"]["youtube"]["po_token"] = [f"web+{po_token}"]
-                extra["extractor_args"]["youtube"]["visitor_data"] = [visitor_data]
-            opts = with_cookies({
-                "quiet": True,
-                "no_warnings": True,
-                "noplaylist": True,
-                "skip_download": True,
-                **extra,
-            }, use_cookies=use_ck)
-            try:
-                with yt_dlp.YoutubeDL(opts) as ydl:
-                    info = ydl.extract_info(wu, download=False)
-                fmts = info.get("formats") or []
-                fmt_id = pick_best_audio_format(fmts)
-                if fmt_id:
-                    break
-                errors.append(f"probe {client} ({'ck' if use_ck else 'no-ck'}): 0 formats returned")
-            except Exception as e:
-                errors.append(f"probe {client} ({'ck' if use_ck else 'no-ck'}): {str(e)[:100]}")
+    for probe_url in (mu, wu):
+        url_label = "music" if "music." in probe_url else "yt"
+        for client in probe_clients:
+            for use_ck in (True, False):
+                extra = {"extractor_args": {"youtube": {"player_client": [client]}}}
+                if po_token and visitor_data and client == "web_creator":
+                    extra["extractor_args"]["youtube"]["po_token"] = [f"web+{po_token}"]
+                    extra["extractor_args"]["youtube"]["visitor_data"] = [visitor_data]
+                opts = with_cookies({
+                    "quiet": True, "no_warnings": True,
+                    "noplaylist": True, "skip_download": True, **extra,
+                }, use_cookies=use_ck)
+                try:
+                    with yt_dlp.YoutubeDL(opts) as ydl:
+                        info = ydl.extract_info(probe_url, download=False)
+                    fmts = info.get("formats") or []
+                    fmt_id = pick_best_audio_format(fmts)
+                    if fmt_id:
+                        break
+                    errors.append(f"probe {url_label}/{client} ({'ck' if use_ck else 'no-ck'}): 0 formats")
+                except Exception as e:
+                    errors.append(f"probe {url_label}/{client} ({'ck' if use_ck else 'no-ck'}): {str(e)[:80]}")
+            if fmt_id:
+                break
         if fmt_id:
             break
 
-    # Phase 2: download
-    dl_clients = ["android_vr", "web_safari", "tv_downgraded", "web_creator", "web"]
-    # build format string: explicit id first, then permissive fallbacks
     fmt_str = f"{fmt_id}/bestaudio*/best" if fmt_id else "bestaudio*/best"
-
     info, last_err = None, None
-    for client in dl_clients:
-        for use_ck in (True, False):
-            extra = {"extractor_args": {"youtube": {"player_client": [client]}}}
-            try:
-                opts = with_cookies({**DL_OPTS_BASE, "format": fmt_str, **extra}, use_cookies=use_ck)
-                with yt_dlp.YoutubeDL(opts) as ydl:
-                    info = ydl.extract_info(wu, download=True)
+    for dl_url in (mu, wu):
+        url_label = "music" if "music." in dl_url else "yt"
+        for client in ("android_vr", "web_safari", "tv_downgraded", "web_creator", "web"):
+            for use_ck in (True, False):
+                extra = {"extractor_args": {"youtube": {"player_client": [client]}}}
+                try:
+                    opts = with_cookies({**DL_OPTS_BASE, "format": fmt_str, **extra}, use_cookies=use_ck)
+                    with yt_dlp.YoutubeDL(opts) as ydl:
+                        info = ydl.extract_info(dl_url, download=True)
+                    break
+                except Exception as e:
+                    last_err = e
+                    errors.append(f"dl {url_label}/{client} ({'ck' if use_ck else 'no-ck'}): {str(e)[:80]}")
+            if info:
                 break
-            except Exception as e:
-                last_err = e
-                errors.append(f"dl {client} ({'ck' if use_ck else 'no-ck'}): {str(e)[:100]}")
         if info:
             break
 
@@ -444,43 +446,43 @@ def show_cookie_info():
         st.table(rows)
 
     # Live test
-    st.write("Live cookie test — tries to resolve a known public video with your cookies:")
+    st.write("Live cookie test — tries multiple clients on a known public video:")
     if st.button("Test cookies now"):
-        TEST_ID = "jNQXAC9IVRw"  # "Me at the zoo" — first ever YouTube video, always public
-        with st.spinner("Testing…"):
-            try:
-                opts = with_cookies({
-                    "quiet": True,
-                    "no_warnings": True,
-                    "skip_download": True,
-                    "noplaylist": True,
-                    "nocheckcertificate": True,
-                }, use_cookies=True)
-                with yt_dlp.YoutubeDL(opts) as ydl:
-                    info = ydl.extract_info(
-                        f"https://www.youtube.com/watch?v={TEST_ID}", download=False
+        TEST_ID = "9bZkp7q19f0"  # Gangnam Style — globally available, no geo-restrictions
+        with st.spinner("Testing clients…"):
+            found = False
+            for test_client in ("web_safari", "tv_downgraded", "android_vr", "web"):
+                try:
+                    opts = with_cookies({
+                        "quiet": True,
+                        "no_warnings": True,
+                        "skip_download": True,
+                        "noplaylist": True,
+                        "extractor_args": {"youtube": {"player_client": [test_client]}},
+                    }, use_cookies=True)
+                    with yt_dlp.YoutubeDL(opts) as ydl:
+                        info = ydl.extract_info(
+                            f"https://www.youtube.com/watch?v={TEST_ID}", download=False
+                        )
+                    fmts = info.get("formats") or []
+                    audio_fmts = [f for f in fmts if not f.get("vcodec") or f["vcodec"] == "none"]
+                    best_audio = ""
+                    if audio_fmts:
+                        b = sorted(audio_fmts, key=lambda f: f.get("abr") or 0, reverse=True)[0]
+                        best_audio = f" · best audio: {b.get('format_id')} {b.get('ext')} {b.get('abr') or '?'} kbps {b.get('acodec') or ''}"
+                    st.success(
+                        f"Client '{test_client}' works with your cookies. "
+                        f"Formats: {len(fmts)} total, {len(audio_fmts)} audio-only.{best_audio}"
                     )
-                fmts = info.get("formats") or []
-                audio_fmts = [f for f in fmts if not f.get("vcodec") or f["vcodec"] == "none"]
-                st.success(
-                    f"Cookies work. Title: '{info.get('title')}'. "
-                    f"Total formats: {len(fmts)}, audio-only: {len(audio_fmts)}."
+                    found = True
+                    break
+                except Exception as e:
+                    st.caption(f"Client {test_client}: {str(e)[:140]}")
+            if not found:
+                st.error(
+                    "All clients failed. Your cookies may be expired or the server IP "
+                    "is fully blocked by YouTube. Re-export fresh cookies and try again."
                 )
-                if audio_fmts:
-                    best = sorted(audio_fmts, key=lambda f: f.get("abr") or 0, reverse=True)[0]
-                    st.info(
-                        f"Best audio format: {best.get('format_id')} "
-                        f"{best.get('ext')} {best.get('abr') or '?'} kbps "
-                        f"{best.get('acodec') or ''}"
-                    )
-            except Exception as e:
-                err = str(e)
-                if "Sign in" in err or "bot" in err.lower():
-                    st.error("Cookies rejected by YouTube (bot detection or session expired). Re-export fresh cookies from your browser.")
-                elif "format" in err.lower():
-                    st.error(f"Connected but no formats available: {err}")
-                else:
-                    st.error(f"Test failed: {err}")
 
     st.write("")
     st.caption(
